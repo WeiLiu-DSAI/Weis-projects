@@ -26,8 +26,8 @@ WITH
       Monthly_recurring_revenue
   ),
   
-  #Cumsum of MRR for each customer
-  Cumulative_MRR AS(
+  #MRR for each customer
+  User_MRR AS(
   SELECT
     CustomerID,
     date,
@@ -35,7 +35,7 @@ WITH
     movement_type,
     DIV(DATE_DIFF(IFNULL(LEAD(date) OVER (PARTITION BY CustomerID ORDER BY date),
           DATE'2019-08-31'),date, DAY),30) month_on_this_plan,
-    SUM(mrr_movement_usd) OVER(PARTITION BY CustomerID ORDER BY date) cum_MRR
+    SUM(mrr_movement_usd) OVER(PARTITION BY CustomerID ORDER BY date) MRR
   FROM
     `tangential-rush-346021.MRR.MRR` ),
 
@@ -47,10 +47,10 @@ WITH
     mrr_movement_usd,
     movement_type,
     month_on_this_plan,
-    cum_MRR,
-    cum_MRR * month_on_this_plan payment
+    MRR,
+    MRR * month_on_this_plan payment
   FROM
-    Cumulative_MRR
+    User_MRR
   GROUP BY
     1,2,3,4,5,6 ),
 
