@@ -1,0 +1,384 @@
+WITH
+  #MRR
+  Monthly_recurring_revenue AS(
+  SELECT
+    month,
+    sum_MRR_mov,
+    sum(sum_MRR_mov) over (order by month) MRR
+  FROM (
+    SELECT
+      DATE_TRUNC(date, MONTH) month,
+      SUM(mrr_movement_usd) sum_MRR_mov
+    FROM
+      `tangential-rush-346021.MRR.MRR`
+    GROUP BY
+      1 )
+  ORDER BY
+    1 ),
+
+  #Growth of MRR
+  MRR_growth AS(
+    SELECT 
+      month,
+      MRR,
+      (MRR - LAG(MRR) over(order by MONTH))/ LAG(MRR) over(order by MONTH) growth
+    FROM
+      Monthly_recurring_revenue
+  ),
+  
+  #Cumsum of MRR for each customer
+  Cumulative_MRR AS(
+  SELECT
+    CustomerID,
+    date,
+    mrr_movement_usd,
+    movement_type,
+    DIV(DATE_DIFF(IFNULL(LEAD(date) OVER (PARTITION BY CustomerID ORDER BY date),
+          DATE'2019-08-31'),date, DAY),30) month_on_this_plan,
+    SUM(mrr_movement_usd) OVER(PARTITION BY CustomerID ORDER BY date) cum_MRR
+  FROM
+    `tangential-rush-346021.MRR.MRR` ),
+
+  #Calculates the period each customer stayed under each different plan they had, and the revenue they generated during each of such period
+  Payments_during_each_plan AS(
+  SELECT
+    CustomerID,
+    date,
+    mrr_movement_usd,
+    movement_type,
+    month_on_this_plan,
+    cum_MRR,
+    cum_MRR * month_on_this_plan payment
+  FROM
+    Cumulative_MRR
+  GROUP BY
+    1,2,3,4,5,6 ),
+
+  #Sum of aformentioned revenue for each customer
+  Monthly_payment AS(
+  SELECT
+    CustomerID,
+    SUM(payment) payments
+  FROM
+    Payments_during_each_plan
+  GROUP BY
+    1 ),
+
+  #Calculates the payment each customer made when they enrolled or reactivated
+  Start_up_cost AS (
+  SELECT
+    CustomerID,
+    SUM(CASE
+        WHEN movement_type IN ('new_biz', 'reactivation') THEN mrr_movement_usd
+      ELSE
+      0
+    END
+      ) cost
+  FROM
+    `tangential-rush-346021.MRR.MRR`
+  GROUP BY
+    1 ),
+
+  #Life time revenue of each customer
+  Customer_revneue AS(
+  SELECT
+    monthly_payment.CustomerID,
+    monthly_payment.payments + start_up_cost.cost Revenue
+  FROM
+    monthly_payment
+  LEFT JOIN start_up_cost USING(CustomerID)
+  ),
+
+  #General info about the customer
+  Customer_info AS(
+  SELECT
+    CustomerID,
+    age,
+    gender,
+    country,
+    MIN(date) OVER (PARTITION BY CustomerID ORDER BY date) enroll_date,
+  FROM
+    `tangential-rush-346021.MRR.MRR` ),
+
+  #Date of the first churn if churned for each customer
+  First_Churn AS(
+  SELECT
+    DISTINCT CustomerID,
+    MIN(date) first_churn_date
+  FROM
+    `tangential-rush-346021.MRR.MRR`
+  WHERE
+    movement_type = 'churn'
+  GROUP BY
+    1),
+
+  #Date of reactivation if reactivated for each customer
+  Reactivation AS(
+  SELECT
+    DISTINCT CustomerID,
+    MIN(date) reactivation_date
+  FROM
+    `tangential-rush-346021.MRR.MRR`
+  WHERE
+    movement_type = 'reactivation'
+  GROUP BY
+    1),
+
+  #Date of second churn if churned after reactivation
+  Second_Churn AS(
+  SELECT
+    DISTINCT CustomerID,
+    date second_churn_date
+  FROM
+    `tangential-rush-346021.MRR.MRR`
+  WHERE
+    movement_type = 'churn'
+    AND TRUE QUALIFY ROW_NUMBER() OVER(PARTITION BY CustomerID ORDER BY date) = 2 ),
+
+  #Complete profile for each customer
+  Customer AS (
+  SELECT
+    DISTINCT Customer_revneue.CustomerID,
+    Customer_info.age,
+    Customer_info.gender,
+    Customer_info.country,
+    Customer_info.enroll_date,
+    First_Churn.first_churn_date,
+    Reactivation.reactivation_date,
+    Second_Churn.second_churn_date,
+    ROUND(Customer_revneue.Revenue,2) Revenue
+  FROM
+    Customer_revneue
+  LEFT JOIN Customer_info USING(CustomerID)
+  LEFT JOIN First_Churn USING(CustomerID)
+  LEFT JOIN Reactivation USING(CustomerID)
+  LEFT JOIN Second_Churn USING(CustomerID)),
+
+  #Number of new users that churned for customers enrolled in each recorded month
+  Churn AS (
+  SELECT
+    month,
+    SUM(churned_with_1_month) churned_with_1_month,
+    SUM(churned_with_3_month) churned_with_3_month,
+    SUM(churned_with_6_month) churned_with_6_month,
+    SUM(churned_with_12_month) churned_with_12_month
+  FROM (
+    #Customers who reactivated and churned again are considered different customers in this regard
+    SELECT
+      DATE_TRUNC(enroll_date, MONTH) month,
+      COUNT(CASE WHEN DATE_DIFF(first_churn_date, enroll_date, DAY) BETWEEN 0 and 30  and second_churn_date is NULL then CustomerID ELSE NULL END) churned_with_1_month,
+      COUNT(CASE WHEN DATE_DIFF(first_churn_date, enroll_date, DAY) BETWEEN 0 and 90  and second_churn_date is NULL then CustomerID ELSE NULL END) churned_with_3_month,
+      COUNT(CASE WHEN DATE_DIFF(first_churn_date, enroll_date, DAY) BETWEEN 0 and 180 and second_churn_date is NULL then CustomerID ELSE NULL END) churned_with_6_month,
+      COUNT(CASE WHEN DATE_DIFF(first_churn_date, enroll_date, DAY) BETWEEN 0 and 360  and second_churn_date is NULL then CustomerID ELSE NULL END) churned_with_12_month,
+    FROM
+      Customer
+    GROUP BY
+      1
+    
+    UNION ALL 
+
+    SELECT
+      DATE_TRUNC(reactivation_date, MONTH) month,
+      COUNT(CASE WHEN DATE_DIFF(second_churn_date, reactivation_date, DAY) BETWEEN 0 and 30  and second_churn_date is not NULL then CustomerID ELSE NULL END) churned_with_1_month,
+      COUNT(CASE WHEN DATE_DIFF(second_churn_date, reactivation_date, DAY) BETWEEN 0 and 90  and second_churn_date is not NULL then CustomerID ELSE NULL END) churned_with_3_month,
+      COUNT(CASE WHEN DATE_DIFF(second_churn_date, reactivation_date, DAY) BETWEEN 0 and 180 and second_churn_date is not NULL then CustomerID ELSE NULL END) churned_with_6_month,
+      COUNT(CASE WHEN DATE_DIFF(second_churn_date, reactivation_date, DAY) BETWEEN 0 and 360  and second_churn_date is not NULL then CustomerID ELSE NULL END) churned_with_12_month,
+    FROM
+      Customer
+    GROUP BY
+      1
+  )
+    WHERE month is not NULL
+  GROUP BY
+    1 ),
+
+  #New subscriber each month
+  New_subscirber AS(
+    SELECT
+    month,
+    SUM(new_sub) new_sub
+  FROM (
+    SELECT
+      month,
+      COUNT(DISTINCT CustomerID) new_sub
+    FROM (
+      SELECT AS STRUCT DATE_TRUNC(MIN(date),MONTH) min_date, DATE_TRUNC(MAX(date),MONTH) max_date FROM `tangential-rush-346021.MRR.MRR`),
+      UNNEST(GENERATE_DATE_ARRAY(min_date, max_date, INTERVAL 1 month)) month
+    JOIN
+      Customer
+    ON
+      DATE_TRUNC(Customer.enroll_date, MONTH) = month 
+    GROUP BY
+      month
+
+    UNION ALL
+
+    SELECT
+      month,
+      COUNT(DISTINCT CustomerID) new_sub
+    FROM (
+      SELECT
+        AS STRUCT DATE_TRUNC(MIN(date),MONTH) min_date,
+        DATE_TRUNC(MAX(date),MONTH) max_date
+      FROM
+        `tangential-rush-346021.MRR.MRR`),
+      UNNEST(GENERATE_DATE_ARRAY(min_date, max_date, INTERVAL 1 month)) month
+    JOIN
+      Customer
+    ON
+      DATE_TRUNC(Customer.reactivation_date, MONTH) = month
+    GROUP BY
+      month )
+  GROUP BY
+    1 
+  ),
+
+  #Churn rate for new users enrolled each month
+  New_user_churn_rate AS(
+    SELECT
+    Churn.month,
+    Churn.churned_with_1_month num_churn_1m,
+    Churn.churned_with_1_month / New_subscirber.new_sub churn_rate_1m,
+    Churn.churned_with_3_month num_churn_3m,
+    Churn.churned_with_3_month / New_subscirber.new_sub churn_rate_3m,
+    Churn.churned_with_6_month num_churn_6m,
+    Churn.churned_with_6_month / New_subscirber.new_sub churn_rate_6m,
+    Churn.churned_with_12_month num_churn_12m,
+    Churn.churned_with_12_month / New_subscirber.new_sub churn_rate_12m,
+    New_subscirber.new_sub  
+    FROM Churn
+    LEFT JOIN New_subscirber
+    USING(MONTH)
+    ),  
+
+
+# All Churned users for each month
+  monthly_churn AS(
+    SELECT
+    month,
+    SUM(num_churn) num_churn
+  FROM (
+    SELECT
+      month,
+      COUNT(DISTINCT CustomerID) num_churn
+    FROM (
+      SELECT AS STRUCT DATE_TRUNC(MIN(date),MONTH) min_date, DATE_TRUNC(MAX(date),MONTH) max_date FROM `tangential-rush-346021.MRR.MRR`),
+      UNNEST(GENERATE_DATE_ARRAY(min_date, max_date, INTERVAL 1 month)) month
+    JOIN
+      Customer
+    ON
+      DATE_TRUNC(Customer.first_churn_date, MONTH) = month 
+    GROUP BY
+      month
+
+    UNION ALL
+
+    SELECT
+      month,
+      COUNT(DISTINCT CustomerID) num_churn
+    FROM (
+      SELECT
+        AS STRUCT DATE_TRUNC(MIN(date),MONTH) min_date,
+        DATE_TRUNC(MAX(date),MONTH) max_date
+      FROM
+        `tangential-rush-346021.MRR.MRR`),
+      UNNEST(GENERATE_DATE_ARRAY(min_date, max_date, INTERVAL 1 month)) month
+    JOIN
+      Customer
+    ON
+      DATE_TRUNC(Customer.second_churn_date, MONTH) = month
+    GROUP BY
+      month )
+  GROUP BY
+    1 
+  ),
+
+  #Active number of subscriber from month to month
+  Active_monthly_subscriber AS(
+  SELECT
+    month,
+    SUM(active_subscriber) active_subscriber
+  FROM (
+    SELECT
+      month,
+      COUNT(DISTINCT CustomerID) active_subscriber
+    FROM (
+      SELECT AS STRUCT DATE_TRUNC(MIN(date),MONTH) min_date, DATE_TRUNC(MAX(date),MONTH) max_date FROM `tangential-rush-346021.MRR.MRR`),
+      UNNEST(GENERATE_DATE_ARRAY(min_date, max_date, INTERVAL 1 month)) month
+    JOIN
+      Customer
+    ON
+      (Customer.enroll_date < DATE_ADD(month, INTERVAL 1 month))
+      AND (Customer.first_churn_date >= month
+        OR Customer.first_churn_date IS NULL)
+    GROUP BY
+      month
+
+    UNION ALL
+
+    SELECT
+      month,
+      COUNT(DISTINCT CustomerID) active_subscriber
+    FROM (
+      SELECT
+        AS STRUCT DATE_TRUNC(MIN(date),MONTH) min_date,
+        DATE_TRUNC(MAX(date),MONTH) max_date
+      FROM
+        `tangential-rush-346021.MRR.MRR`),
+      UNNEST(GENERATE_DATE_ARRAY(min_date, max_date, INTERVAL 1 month)) month
+    JOIN
+      Customer
+    ON
+      (Customer.reactivation_date < DATE_ADD(month, INTERVAL 1 month))
+      AND (Customer.second_churn_date >= month
+        OR Customer.second_churn_date IS NULL)
+    GROUP BY
+      month )
+  GROUP BY
+    1 ),
+
+  #As name suggested
+  Monthly_churn_rate AS(
+    SELECT
+    Monthly_churn.month,
+    Monthly_churn.num_churn,
+    Active_monthly_subscriber.active_subscriber,
+    Monthly_churn.num_churn / Active_monthly_subscriber.active_subscriber monthly_churn
+    FROM Monthly_churn
+    LEFT JOIN Active_monthly_subscriber
+    USING(MONTH)
+    ),    
+
+  #Month to Month growth of active subscribers
+  monthly_subscriber_growth AS(
+  SELECT
+    month,
+    active_subscriber,
+    (active_subscriber - LAG(active_subscriber) OVER (ORDER BY month))/LAG(active_subscriber) OVER (ORDER BY month) AS growth
+  FROM
+    active_monthly_subscriber ),
+
+  #Average Revenue Per User
+  Avg_rev AS(
+  SELECT month, Monthly_recurring_revenue.MRR/Active_monthly_subscriber.active_subscriber ARPU
+  FROM Monthly_recurring_revenue
+  JOIN Active_monthly_subscriber
+  USING (month)
+  ),
+
+  #Growth of ARPU
+  ARPU_growth AS(
+  SELECT 
+  month,
+  ARPU, 
+  (ARPU - LAG(ARPU) OVER (ORDER BY month))/LAG(ARPU) OVER (ORDER BY month) AS growth
+  FROM 
+  Avg_rev
+  )
+
+SELECT
+  *
+FROM
+  ARPU_growth
+ORDER BY
+  month
